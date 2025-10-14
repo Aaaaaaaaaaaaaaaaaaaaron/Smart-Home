@@ -1,3 +1,15 @@
+/*
+// platformio.ini:
+[env:az-delivery-devkit-v4]
+platform = espressif32
+board = az-delivery-devkit-v4
+framework = arduino
+monitor_speed = 115200
+lib_deps = adafruit/Adafruit BME280 Library@^2.3.0
+board_build.partitions = huge_app.csv
+*/
+
+
 
 #include <Wire.h>
 #include <Adafruit_Sensor.h>
