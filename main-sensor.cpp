@@ -1,106 +1,123 @@
-// ...existing code...
-#include <Wire.h> 
+#include <Wire.h>
 #include <Adafruit_Sensor.h>
 #include <Adafruit_BME280.h>
 #include <WiFi.h>
+#include <WebServer.h>
 #include <PubSubClient.h>
-#include <BLEDevice.h>
-#include <BLEServer.h>
-#include <BLEUtils.h>
-#include <BLE2902.h>
-// ...existing code...
 
-// ====================
-// Sensor
-// ====================
-Adafruit_BME280 bme; // I2C
-unsigned long lastRead = 0;
-const unsigned long interval = 60000; // 60 Sekunden
+// === Konfiguration ===
+const char* stored_ssid    = "WLAN-RDF-EU"; //"iPhoneJacob";   // Default / gespeicherte SSID
+const char* stored_pass    = "wlan@RdF"; //"jackyjack";     // Default / gespeichertes PW
+String mqtt_server        = "172.20.15.179"; //"172.20.10.3";    // Broker-IP (änderbar via Web‑Form)
+int    mqtt_port          = 1883;             // Broker-Port (änderbar)
 
-// ====================
-// WLAN & MQTT
-// ====================
-const char* ssid = "iPhoneJacob";
-const char* password = "jackyjack";
-
-const char* mqtt_server = "172.20.10.3"; // alte ip: 192.168.80.1
-const int mqtt_port = 1883;
-
+Adafruit_BME280 bme;
+WebServer server(80);
 WiFiClient wifiClient;
 PubSubClient client(wifiClient);
 
-// ====================
-// BLE Provisioning
-// ====================
-#define SERVICE_UUID        "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
-#define CHAR_SSID_UUID      "beb5483e-36e1-4688-b7f5-ea07361b26a8"
-#define CHAR_PASS_UUID      "ab34c9e5-8c3b-4f6b-9d49-1b2c3d4e5f60"
+unsigned long lastRead = 0;
+const unsigned long interval = 60000; // 60s
+bool provisioningActive = false;
 
-String prov_ssid = "";
-String prov_pass = "";
-bool prov_received = false;
-BLECharacteristic* ssidChar;
-BLECharacteristic* passChar;
+// Vorwärtsdeklaration, damit handleSave() reconnect_mqtt() aufrufen kann
+void reconnect_mqtt();
 
-class SSIDCallback : public BLECharacteristicCallbacks {
-  void onWrite(BLECharacteristic* pChar) {
-    std::string val = pChar->getValue();
-    prov_ssid = String(val.c_str());
-    Serial.print("BLE SSID empfangen: ");
-    Serial.println(prov_ssid);
-    if (prov_ssid.length() && prov_pass.length()) prov_received = true;
-  }
-};
-
-class PASSCallback : public BLECharacteristicCallbacks {
-  void onWrite(BLECharacteristic* pChar) {
-    std::string val = pChar->getValue();
-    prov_pass = String(val.c_str());
-    Serial.print("BLE PASS empfangen: ");
-    Serial.println(prov_pass);
-    if (prov_ssid.length() && prov_pass.length()) prov_received = true;
-  }
-};
-
-// ====================
-// WLAN Verbindung (jetzt mit BLE Provisioning fallback)
-// ====================
-void startBleProvisioning() {
-  BLEDevice::init("ESP32-Provisioning-BLE-Aaron"); // Aaron Hinzugefügt
-  BLEServer *pServer = BLEDevice::createServer();
-  BLEService *pService = pServer->createService(SERVICE_UUID);
-
-  ssidChar = pService->createCharacteristic(CHAR_SSID_UUID, BLECharacteristic::PROPERTY_WRITE);
-  passChar = pService->createCharacteristic(CHAR_PASS_UUID, BLECharacteristic::PROPERTY_WRITE);
-
-  ssidChar->setCallbacks(new SSIDCallback());
-  passChar->setCallbacks(new PASSCallback());
-
-  // Notify clients that they can write (optional)
-  ssidChar->addDescriptor(new BLE2902());
-  passChar->addDescriptor(new BLE2902());
-
-  pService->start();
-  BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
-  pAdvertising->addServiceUUID(SERVICE_UUID);
-  pAdvertising->setScanResponse(true);
-  pAdvertising->setMinPreferred(0x06);  // functions that help with iPhone connections
-  pAdvertising->setMinPreferred(0x12);
-  BLEDevice::startAdvertising();
-
-  Serial.println("BLE-Provisioning gestartet - verbinde mit 'ESP32-Provisioning-BLE' und schreibe SSID & PASS");
+// --- WebServer (Provisioning) ---
+void handleRoot() {
+  String page =
+    "<!doctype html><html><head><meta charset='utf-8'><title>ESP32 Provisioning</title></head><body>"
+    "<h3>ESP32 WLAN + MQTT Provisioning</h3>"
+    "<form action=\"/save\" method=\"post\">"
+    "SSID: <input type=\"text\" name=\"ssid\" value=\"";
+  page += stored_ssid;
+  page += "\"><br><br>";
+  page += "Passwort: <input type=\"password\" name=\"pass\" value=\"";
+  page += stored_pass;
+  page += "\"><br><br>";
+  page += "MQTT Broker (IP/Hostname): <input type=\"text\" name=\"mqtt\" value=\"";
+  page += mqtt_server;
+  page += "\"><br><br>";
+  page += "MQTT Port: <input type=\"number\" name=\"mqttport\" value=\"";
+  page += String(mqtt_port);
+  page += "\"><br><br>";
+  page += "<input type=\"submit\" value=\"Speichern & Verbinden\">"
+    "</form>"
+    "<p>Verbinde dein Handy mit dem WLAN <b>esp32-Aaron</b> und öffne http://192.168.4.1</p>"
+    "</body></html>";
+  server.send(200, "text/html", page);
 }
 
+void handleSave() {
+  String newSsid = server.arg("ssid");
+  String newPass = server.arg("pass");
+  String newMqtt = server.arg("mqtt");
+  String newMqttPort = server.arg("mqttport");
+
+  Serial.printf("Provisioning erhalten -> SSID: '%s'  PASS: '%s'  MQTT: '%s'  PORT: '%s'\n",
+                newSsid.c_str(), newPass.c_str(), newMqtt.c_str(), newMqttPort.c_str());
+
+  // Update stored values in RAM
+  if (newSsid.length()) {
+    // copy to stored_ssid (const char*) - keep original defaults for next boot unless you implement persistent storage
+    // If you want persistence, use Preferences to write newSsid/newPass/newMqtt/newMqttPort
+    // For now, update the globals used during this run:
+    // Note: stored_ssid/stored_pass are const char* defaults; use them for display only.
+    // We'll use local variables for the active credentials:
+  }
+
+  // Set active MQTT server/port if provided
+  if (newMqtt.length()) mqtt_server = newMqtt;
+  if (newMqttPort.length()) mqtt_port = newMqttPort.toInt();
+
+  server.send(200, "text/html", "<html><body><h3>Versuche zu verbinden...</h3><p>Bitte dieses Fenster offen lassen.</p></body></html>");
+
+  // stop Webserver/AP and try to connect with new WiFi credentials
+  provisioningActive = false;
+  server.stop();
+  WiFi.softAPdisconnect(true);
+  delay(200);
+
+  Serial.println("Versuche Verbindung mit neuen Credentials...");
+  if (newSsid.length()) {
+    WiFi.begin(newSsid.c_str(), newPass.c_str());
+  } else {
+    // fallback to stored defaults if no SSID provided
+    WiFi.begin(stored_ssid, stored_pass);
+  }
+
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) {
+    delay(500);
+    Serial.print(".");
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nWLAN verbunden (provisioned)");
+    Serial.print("IP-Adresse: ");
+    Serial.println(WiFi.localIP());
+
+    // update MQTT client with potentially new server/port and try to connect
+    client.setServer(mqtt_server.c_str(), mqtt_port);
+    reconnect_mqtt();
+  } else {
+    Serial.println("\nVerbindung fehlgeschlagen. Starte AP erneut.");
+    WiFi.softAP("esp32-Aaron"); // AP-Name wie gewünscht
+    server.begin();
+    provisioningActive = true;
+    Serial.print("AP IP: ");
+    Serial.println(WiFi.softAPIP());
+  }
+}
+
+// === WLAN / Provisioning ===
 void setup_wifi() {
   Serial.println();
   Serial.print("Versuche, mit gespeicherter SSID zu verbinden: ");
-  Serial.println(ssid);
+  Serial.println(stored_ssid);
 
-  WiFi.begin(ssid, password);
+  WiFi.begin(stored_ssid, stored_pass);
 
   unsigned long startAttemptTime = millis();
-
-  // 15 Sekunden normal versuchen
   while (WiFi.status() != WL_CONNECTED && millis() - startAttemptTime < 15000) {
     delay(500);
     Serial.print(".");
@@ -113,105 +130,113 @@ void setup_wifi() {
     return;
   }
 
-  // Normalverbindung fehlgeschlagen -> BLE Provisioning starten
-  Serial.println("\nWLAN-Verbindung fehlgeschlagen! Starte BLE-Provisioning...");
-  startBleProvisioning();
+  // Verbindung fehlgeschlagen -> starte SoftAP + Webserver zur Provisionierung
+  Serial.println("\nWLAN-Verbindung fehlgeschlagen! Starte Access Point zur Provisionierung...");
+  WiFi.softAP("esp32-Aaron"); // offenes AP mit deinem Namen
+  Serial.print("AP gestartet: esp32-Aaron  | AP IP-Adresse: ");
+  Serial.println(WiFi.softAPIP());
 
-  // Warte auf Daten über BLE (Timeout 5 Minuten)
-  unsigned long provStart = millis();
-  while (!prov_received && millis() - provStart < 5UL * 60UL * 1000UL) {
-    delay(100);
-    // prov_received wird von BLE-Callbacks gesetzt
-  }
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/save", HTTP_POST, handleSave);
+  server.onNotFound([](){
+    server.send(404, "text/plain", "Not found");
+  });
+  server.begin();
+  provisioningActive = true;
+  Serial.println("Provisioning Webserver gestartet -> öffne http://192.168.4.1");
+}
 
-  BLEDevice::stopAdvertising();
-  BLEDevice::deinit(true);
-
-  if (prov_received) {
-    Serial.println("Provisioning-Daten erhalten. Versuche Verbindung mit neuem Netzwerk...");
-    Serial.print("SSID: "); Serial.println(prov_ssid);
-    // verbindungsversuch mit neuen credentials
-    WiFi.begin(prov_ssid.c_str(), prov_pass.c_str());
-
-    unsigned long start = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) {
-      delay(500);
-      Serial.print(".");
-    }
-    if (WiFi.status() == WL_CONNECTED) {
-      Serial.println("\nWLAN verbunden (provisioned)");
-      Serial.print("IP-Adresse: ");
-      Serial.println(WiFi.localIP());
-      // optional: speichere neue Credentials dauerhaft (SPIFFS / Preferences) - nicht implementiert hier
-      return;
-    } else {
-      Serial.println("\nVerbindung mit neuen Daten fehlgeschlagen. BLE-Provisioning beenden.");
-    }
+// === MQTT Helfer ===
+bool check_mqtt_reachable(const char* host, uint16_t port) {
+  WiFiClient testClient;
+  Serial.printf("Teste TCP zu %s:%u ... ", host, port);
+  bool ok = testClient.connect(host, port);
+  if (ok) {
+    Serial.println("erreichbar");
+    testClient.stop();
+    return true;
   } else {
-    Serial.println("Kein Provisioning erhalten (Timeout).");
+    Serial.println("nicht erreichbar");
+    return false;
   }
 }
-// ...existing code...
 
-// ====================
-// MQTT Auto-Reconnect
-// ====================
 void reconnect_mqtt() {
-  while (!client.connected()) {
-    Serial.print("Versuche MQTT-Verbindung...");
-    if (client.connect("ESP32Client")) {
-      Serial.println("Verbunden!");
-    } else {
-      Serial.print("Fehlercode: ");
-      Serial.print(client.state());
-      Serial.println(" -> erneuter Versuch in 5 Sekunden");
-      delay(5000);
-    }
+  if (client.connected()) return;
+
+  Serial.print("Versuche MQTT-Verbindung... ");
+  Serial.print("IP: ");
+  Serial.print(WiFi.localIP());
+  Serial.print("  Broker: ");
+  Serial.print(mqtt_server);
+  Serial.print(":");
+  Serial.println(mqtt_port);
+
+  if (!check_mqtt_reachable(mqtt_server.c_str(), mqtt_port)) {
+    Serial.println("MQTT-Broker nicht erreichbar von diesem WLAN. Warte 10s und versuche später.");
+    delay(10000);
+    return;
+  }
+
+  String clientId = "ESP32Client-";
+  clientId += WiFi.macAddress();
+
+  if (client.connect(clientId.c_str())) {
+    Serial.println("MQTT verbunden!");
+  } else {
+    int st = client.state();
+    Serial.print("Fehlercode: ");
+    Serial.print(st);
+    Serial.println(" -> erneuter Versuch in 5 Sekunden");
+    delay(5000);
   }
 }
 
-// ====================
-// Setup
-// ====================
+// === Setup / Loop ===
 void setup() {
   Serial.begin(115200);
-  delay(2000); // Sensor hochfahren lassen
+  delay(2000);
 
-  // Sensor starten
+  Wire.begin(21, 22); // SDA, SCL
   if (!bme.begin(0x76)) {
-    Serial.println("Sensor nicht gefunden!");
-    while (1);
+    Serial.println("BME280 nicht gefunden auf 0x76!");
+    // falls kein Sensor: trotzdem weiter (nur keine Messwerte)
   }
 
-  // WLAN (mit BLE-Provisioning fallback)
   setup_wifi();
 
-  client.setServer(mqtt_server, mqtt_port);
-  reconnect_mqtt(); // MQTT Verbindung aufbauen
+  client.setServer(mqtt_server.c_str(), mqtt_port);
+  reconnect_mqtt();
+
+  // sofort erste Messung senden
+  lastRead = millis() - interval;
 }
 
-// ====================
-// Loop
-// ====================
 void loop() {
-  if (!client.connected()) {
-    reconnect_mqtt(); // Auto-Reconnect
+  if (provisioningActive) {
+    server.handleClient();
   }
-  client.loop(); // Verbindung aufrecht halten
+
+  if (!client.connected()) {
+    reconnect_mqtt();
+  } else {
+    client.loop();
+  }
 
   if (millis() - lastRead >= interval) {
     lastRead = millis();
 
-    float temp = bme.readTemperature();
-    float hum  = bme.readHumidity();
-    float pres = bme.readPressure() / 100.0F;
+    float temp = NAN, hum = NAN, pres = NAN;
+    if (bme.begin(0x76)) { // sicherstellen, Sensor verfügbar
+      temp = bme.readTemperature();
+      hum  = bme.readHumidity();
+      pres = bme.readPressure() / 100.0F;
+    }
 
-    // Terminalausgabe
     Serial.printf("Temp: %.2f C  Hum: %.2f %%  Druck: %.2f hPa\n", temp, hum, pres);
 
-    // MQTT-Nachricht
-    char payload[100];
+    char payload[128];
     snprintf(payload, sizeof(payload), "Temp: %.2f C, Hum: %.2f %%, Druck: %.2f hPa", temp, hum, pres);
-    client.publish("sensor/test", payload);
+    if (client.connected()) client.publish("sensor/test", payload);
   }
 }
