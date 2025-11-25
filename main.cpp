@@ -1,0 +1,533 @@
+#include <Wire.h>
+#include <SPI.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_ILI9341.h>
+#include <RTClib.h>
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <WebServer.h>
+#include <EEPROM.h>
+
+// Display Pins
+#define TFT_CS   5
+#define TFT_DC   2
+#define TFT_RST  4
+
+Adafruit_ILI9341 tft = Adafruit_ILI9341(TFT_CS, TFT_DC, TFT_RST);
+RTC_DS3231 rtc;
+
+// WiFi & MQTT
+const char* ssid = "WLAN-RDF-EU";          // WLAN Name
+const char* password = "wlan@RdF";  // WLAN Passwort
+const char* mqttServer = "172.20.15.179";
+const int mqttPort = 1883;
+const char* mqttTopic = "sensor/test";
+
+// EEPROM Adressen für Konfiguration
+#define EEPROM_SIZE 512
+#define ADDR_SSID 0
+#define ADDR_PASS 32
+#define ADDR_MQTT_IP 64
+#define ADDR_MQTT_PORT 80
+#define ADDR_MQTT_TOPIC 84
+
+// WiFi & MQTT Variablen (aus EEPROM)
+String stored_ssid = "";
+String stored_password = "";
+String stored_mqttServer = "172.20.15.179";
+int stored_mqttPort = 1883;
+String stored_mqttTopic = "sensor/test";
+
+WiFiClient espClient;
+PubSubClient client(espClient);
+WebServer server(80);
+
+bool apMode = false;
+
+// Variablen für Texte
+String greetingText = "Hallo Jacob";
+
+// Sensorwerte als Zahlen
+float temperature = 0;
+float humidity = 0;
+float pressure = 0;
+
+// Flag für erste Verbindungs-Nachricht
+bool connectionMessageSent = false;
+
+// Forward Declarations
+void saveConfig();
+void loadConfig();
+
+// Funktion, um MQTT-Nachrichten zu verarbeiten
+void callback(char* topic, byte* payload, unsigned int length) {
+  Serial.println("\n=== CALLBACK AUFGERUFEN ===");
+  Serial.print("Topic: ");
+  Serial.println(topic);
+  Serial.print("Length: ");
+  Serial.println(length);
+  
+  String msg = "";
+  for (unsigned int i = 0; i < length; i++) {
+    msg += (char)payload[i];
+  }
+  
+  Serial.print("MQTT Nachricht erhalten: ");
+  Serial.println(msg);
+  
+  // Format: Temp: 23.31 C, Hum: 39.40 %, Druck: 982.73 hPa
+  int tIndex = msg.indexOf("Temp:");
+  int hIndex = msg.indexOf("Hum:");
+  int pIndex = msg.indexOf("Druck:");
+
+  Serial.print("Indizes - tIndex: ");
+  Serial.print(tIndex);
+  Serial.print(" hIndex: ");
+  Serial.print(hIndex);
+  Serial.print(" pIndex: ");
+  Serial.println(pIndex);
+
+  if (tIndex != -1 && hIndex != -1 && pIndex != -1) {
+    String tempStr = msg.substring(tIndex + 6, hIndex - 2);
+    String humStr = msg.substring(hIndex + 5, pIndex - 2);
+    String presStr = msg.substring(pIndex + 7);
+    
+    Serial.print("Raw Strings - Temp: '");
+    Serial.print(tempStr);
+    Serial.print("' Hum: '");
+    Serial.print(humStr);
+    Serial.print("' Pres: '");
+    Serial.print(presStr);
+    Serial.println("'");
+    
+    // Remove "hPa" from pressure string
+    int hpaPos = presStr.indexOf(" h");
+    if (hpaPos != -1) {
+      presStr = presStr.substring(0, hpaPos);
+    }
+
+    float temp = tempStr.toFloat();
+    float hum = humStr.toFloat();
+    float pres = presStr.toFloat();
+    
+    Serial.print("Parsed - Temp: ");
+    Serial.print(temp);
+    Serial.print(" C, Hum: ");
+    Serial.print(hum);
+    Serial.print(" %, Pressure: ");
+    Serial.print(pres);
+    Serial.println(" hPa");
+    
+    // Nur wenn Werte sinnvoll sind
+    if (temp > -50 && temp < 150 && hum >= 0 && hum <= 100 && pres > 0) {
+      temperature = temp;
+      humidity = hum;
+      pressure = pres;
+      Serial.println(">>> Werte aktualisiert! <<<");
+    } else {
+      Serial.println("Werte außerhalb des Bereichs!");
+    }
+  } else {
+    Serial.println("Parsing fehlgeschlagen - Format nicht erkannt");
+  }
+  Serial.println("=== CALLBACK ENDE ===\n");
+}
+
+// Verbindung zu MQTT herstellen
+unsigned long lastReconnectAttempt = 0;
+void reconnect() {
+  unsigned long now = millis();
+  if (now - lastReconnectAttempt > 5000) {  // Nur alle 5 Sekunden versuchen
+    lastReconnectAttempt = now;
+    
+    if (!client.connected()) {
+      Serial.print("Verbinde mit MQTT (");
+      Serial.print(stored_mqttServer);
+      Serial.print(":");
+      Serial.print(stored_mqttPort);
+      Serial.print(") - Topic: ");
+      Serial.println(stored_mqttTopic);
+      
+      if (client.connect("ESP32Client")) {
+        Serial.println("MQTT verbunden!");
+        if (client.subscribe(stored_mqttTopic.c_str())) {
+          Serial.print("Subscribed zu: ");
+          Serial.println(stored_mqttTopic);
+        } else {
+          Serial.println("Subscribe fehlgeschlagen!");
+        }
+      } else {
+        Serial.print("MQTT Fehler, rc=");
+        Serial.println(client.state());
+      }
+    }
+  }
+}
+
+// EEPROM lesen
+void loadConfig() {
+  EEPROM.begin(EEPROM_SIZE);
+  
+  // SSID lesen
+  char ssid_buf[32] = {0};
+  EEPROM.readBytes(ADDR_SSID, (uint8_t*) ssid_buf, 32);
+  stored_ssid = String(ssid_buf);
+  
+  // Password lesen
+  char pass_buf[32] = {0};
+  EEPROM.readBytes(ADDR_PASS, (uint8_t*) pass_buf, 32);
+  stored_password = String(pass_buf);
+  
+  // MQTT IP lesen
+  char mqtt_ip_buf[16] = {0};
+  EEPROM.readBytes(ADDR_MQTT_IP, (uint8_t*) mqtt_ip_buf, 16);
+  stored_mqttServer = String(mqtt_ip_buf);
+  
+  // MQTT Port lesen
+  EEPROM.readBytes(ADDR_MQTT_PORT, (uint8_t*) &stored_mqttPort, 4);
+  
+  // MQTT Topic lesen
+  char mqtt_topic_buf[32] = {0};
+  EEPROM.readBytes(ADDR_MQTT_TOPIC, (uint8_t*) mqtt_topic_buf, 32);
+  stored_mqttTopic = String(mqtt_topic_buf);
+  
+  Serial.println("\n=== EEPROM Konfiguration geladen ===");
+  Serial.print("SSID: '");
+  Serial.print(stored_ssid);
+  Serial.print("' (Länge: ");
+  Serial.print(stored_ssid.length());
+  Serial.println(")");
+  Serial.print("Topic: '");
+  Serial.print(stored_mqttTopic);
+  Serial.print("' (Länge: ");
+  Serial.print(stored_mqttTopic.length());
+  Serial.println(")");
+  
+  // Falls noch nichts gespeichert, Standard verwenden
+  if (stored_ssid.length() == 0) {
+    Serial.println("Keine SSID gespeichert, nutze Standard");
+    stored_ssid = ssid;
+    stored_password = password;
+    stored_mqttTopic = "sensor/test";
+    saveConfig();
+  }
+}
+
+// EEPROM speichern
+void saveConfig() {
+  EEPROM.begin(EEPROM_SIZE);
+  EEPROM.writeBytes(ADDR_SSID, (uint8_t*) stored_ssid.c_str(), 32);
+  EEPROM.writeBytes(ADDR_PASS, (uint8_t*) stored_password.c_str(), 32);
+  EEPROM.writeBytes(ADDR_MQTT_IP, (uint8_t*) stored_mqttServer.c_str(), 16);
+  EEPROM.writeBytes(ADDR_MQTT_PORT, (uint8_t*) &stored_mqttPort, 4);
+  EEPROM.writeBytes(ADDR_MQTT_TOPIC, (uint8_t*) stored_mqttTopic.c_str(), 32);
+  EEPROM.commit();
+}
+
+// Webserver Root-Seite
+void handleRoot() {
+  String html = R"(
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <title>WiFi & MQTT Config</title>
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <style>
+        body { font-family: Arial; text-align: center; padding: 20px; background-color: #f0f0f0; }
+        .container { max-width: 400px; margin: auto; background-color: white; padding: 20px; border-radius: 8px; box-shadow: 0 0 10px rgba(0,0,0,0.1); }
+        h1 { color: #333; }
+        input { width: 100%; padding: 10px; margin: 10px 0; box-sizing: border-box; border: 1px solid #ddd; border-radius: 4px; }
+        button { width: 100%; padding: 10px; background-color: #4CAF50; color: white; border: none; border-radius: 4px; cursor: pointer; font-size: 16px; }
+        button:hover { background-color: #45a049; }
+        label { display: block; text-align: left; font-weight: bold; margin-top: 10px; }
+      </style>
+    </head>
+    <body>
+      <div class="container">
+        <h1>Smart Home Config</h1>
+        <form action="/save" method="POST">
+          <label>WiFi SSID:</label>
+          <input type="text" name="ssid" value=")" + stored_ssid + R"(" required>
+          
+          <label>WiFi Password:</label>
+          <input type="password" name="password" value=")" + stored_password + R"(" required>
+          
+          <label>MQTT Server IP:</label>
+          <input type="text" name="mqtt_ip" value=")" + stored_mqttServer + R"(" required>
+          
+          <label>MQTT Port:</label>
+          <input type="number" name="mqtt_port" value=")" + String(stored_mqttPort) + R"(" required>
+          
+          <label>MQTT Topic:</label>
+          <input type="text" name="mqtt_topic" value=")" + stored_mqttTopic + R"(" required>
+          
+          <button type="submit">Speichern & Neu Starten</button>
+        </form>
+      </div>
+    </body>
+    </html>
+  )";
+  
+  server.send(200, "text/html", html);
+}
+
+// Webserver Speicher-Funktion
+void handleSave() {
+  if (server.hasArg("ssid") && server.hasArg("password") && server.hasArg("mqtt_ip") && 
+      server.hasArg("mqtt_port") && server.hasArg("mqtt_topic")) {
+    
+    stored_ssid = server.arg("ssid");
+    stored_password = server.arg("password");
+    stored_mqttServer = server.arg("mqtt_ip");
+    stored_mqttPort = server.arg("mqtt_port").toInt();
+    stored_mqttTopic = server.arg("mqtt_topic");
+    
+    saveConfig();
+    
+    server.send(200, "text/html", "<h1>Gespeichert!</h1><p>Starten Sie den ESP32 neu...</p>");
+    delay(2000);
+    ESP.restart();
+  } else {
+    server.send(400, "text/plain", "Fehlende Parameter");
+  }
+}
+
+// AP Modus starten
+void startAPMode() {
+  apMode = true;
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP("SmartHome-Config", "12345678");
+  
+  Serial.println("\n\nAP Mode gestartet!");
+  Serial.print("SSID: SmartHome-Config");
+  Serial.print("IP: ");
+  Serial.println(WiFi.softAPIP());
+  
+  server.on("/", handleRoot);
+  server.on("/save", HTTP_POST, handleSave);
+  server.begin();
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  Serial.println("\n\nStarting setup...");
+
+  // EEPROM laden
+  loadConfig();
+  
+  // Falls Topic nicht gespeichert oder falsch, korrigiere es
+  if (stored_mqttTopic.length() == 0 || stored_mqttTopic.indexOf("Sensor") != -1) {
+    Serial.println(">>> WARNUNG: Topic ist leer oder falsch gespeichert! Setze auf 'sensor/test'");
+    stored_mqttTopic = "sensor/test";
+    saveConfig();
+  }
+
+  // RTC starten
+  if (!rtc.begin()) {
+    Serial.println("Keine RTC gefunden!");
+    while (1);
+  }
+
+  if (rtc.lostPower()) {
+    rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+  }
+
+  // Display starten
+  tft.begin();
+  tft.setRotation(1);
+  tft.fillScreen(ILI9341_BLACK);
+
+  // WLAN verbinden
+  WiFi.mode(WIFI_STA);
+  Serial.println("");
+  Serial.print("Verbinde mit WLAN: ");
+  Serial.println(stored_ssid);
+  WiFi.begin(stored_ssid.c_str(), stored_password.c_str());
+  
+  int timeout = 0;
+  while (WiFi.status() != WL_CONNECTED && timeout < 60) {  // 30 Sekunden (60 * 500ms)
+    delay(500);
+    Serial.print(".");
+    timeout++;
+  }
+  
+  Serial.println("");
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("WiFi verbunden!");
+    Serial.print("IP-Adresse: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("WiFi Verbindung fehlgeschlagen! Starte AP Mode für Konfiguration...");
+    startAPMode();
+    return;
+  }
+
+  client.setServer(stored_mqttServer.c_str(), stored_mqttPort);
+  client.setCallback(callback);
+  
+  // MQTT verbindung herstellen
+  Serial.print("Verbinde mit MQTT (");
+  Serial.print(stored_mqttServer);
+  Serial.print(":");
+  Serial.print(stored_mqttPort);
+  Serial.println(")...");
+  
+  int mqtt_timeout = 0;
+  while (!client.connected() && mqtt_timeout < 20) {
+    if (client.connect("ESP32Client")) {
+      Serial.println("MQTT verbunden!");
+      client.subscribe(stored_mqttTopic.c_str());
+      Serial.print("Subscribed zu Topic: ");
+      Serial.println(stored_mqttTopic);
+      break;
+    } else {
+      Serial.print("MQTT Fehler rc=");
+      Serial.print(client.state());
+      Serial.println(" - Versuche erneut...");
+      delay(500);
+      mqtt_timeout++;
+    }
+  }
+  
+  if (client.connected()) {
+    Serial.println("\nWarte auf MQTT Nachrichten...");
+    
+    // Sende Verbindungs-Nachricht
+    String connectionMsg = "ESP32 verbunden!";
+    client.publish(stored_mqttTopic.c_str(), connectionMsg.c_str());
+    Serial.print("Verbindungs-Nachricht gesendet zu: ");
+    Serial.println(stored_mqttTopic);
+    Serial.print("Nachricht: ");
+    Serial.println(connectionMsg);
+    
+    connectionMessageSent = true;
+    
+    // Display mit "Warte auf Daten" Nachricht
+    tft.fillScreen(ILI9341_BLACK);
+    tft.setCursor(10, 50);
+    tft.setTextSize(2);
+    tft.setTextColor(ILI9341_YELLOW);
+    tft.println("Warte auf");
+    tft.println("Daten...");
+  }
+}
+
+unsigned long lastDisplayUpdate = 0;
+unsigned long lastLoopCount = 0;
+
+void loop() {
+  // Zähle wie oft die Loop aufgerufen wird
+  lastLoopCount++;
+  
+  // MQTT verarbeiten und auf Nachrichten warten
+  if (!apMode) {
+    // Stelle sicher, dass die Verbindung stabil ist
+    if (!client.connected()) {
+      Serial.println("MQTT nicht verbunden - Reconnect...");
+      reconnect();
+    } else {
+      // client.loop() verarbeitet eingehende Nachrichten
+      client.loop();
+    }
+  } else {
+    // AP Mode: Webserver verarbeiten
+    server.handleClient();
+  }
+
+  // Display aktualisieren, aber nicht zu oft (alle 500ms)
+  unsigned long now_ms = millis();
+  if (now_ms - lastDisplayUpdate >= 500) {
+    lastDisplayUpdate = now_ms;
+    
+    // Debug: Zeige Loop-Frequenz
+    Serial.print("Loop-Frequenz: ");
+    Serial.print(lastLoopCount * 2);  // * 2 weil alle 500ms
+    Serial.print(" Hz | MQTT: ");
+    Serial.print(client.connected() ? "Connected" : "Disconnected");
+    Serial.print(" | Temp: ");
+    Serial.print(temperature);
+    Serial.println(" C");
+    lastLoopCount = 0;
+    
+    DateTime now = rtc.now();
+
+    // Alles löschen
+    tft.fillScreen(ILI9341_BLACK);
+
+    // "Hallo Jacob" (Pink)
+    tft.setCursor(10, 5);
+    tft.setTextSize(2);
+    tft.setTextColor(ILI9341_MAGENTA);
+    tft.print(greetingText);
+
+    // Sensorwerte anzeigen (Gelb)
+    tft.setTextSize(2);
+    tft.setTextColor(ILI9341_YELLOW);
+
+    tft.setCursor(10, 30);
+    tft.print("Temp: ");
+    tft.print(temperature, 2);
+    tft.print(" C");
+
+    tft.setCursor(10, 50);
+    tft.print("Humidity: ");
+    tft.print(humidity, 2);
+    tft.print("%");
+
+    tft.setCursor(10, 70);
+    tft.print("Pressure: ");
+    tft.print(pressure, 2);
+    tft.print(" hPa");
+
+    // Verbindungsstatus (Grün/Rot)
+    tft.setTextSize(1);
+    if (client.connected()) {
+      tft.setTextColor(ILI9341_GREEN);
+      tft.setCursor(10, 95);
+      tft.print("MQTT: Connected");
+    } else {
+      tft.setTextColor(ILI9341_RED);
+      tft.setCursor(10, 95);
+      tft.print("MQTT: Disconnected");
+    }
+
+    // Datum rechts unten über Uhrzeit (Cyan)
+    tft.setTextSize(2);
+    tft.setTextColor(ILI9341_CYAN);
+
+    String dateStr = "";
+    if (now.day() < 10) dateStr += "0";
+    dateStr += String(now.day()) + ".";
+    if (now.month() < 10) dateStr += "0";
+    dateStr += String(now.month()) + ".";
+    dateStr += String(now.year());
+
+    int dateX = tft.width() - 160;
+    int dateY = tft.height() - 50;
+    tft.setCursor(dateX, dateY);
+    tft.print(dateStr);
+
+    // Uhrzeit rechts unten (Rot)
+    tft.setTextSize(3);
+    tft.setTextColor(ILI9341_RED);
+
+    int marginRight = 10;
+    int marginBottom = 10;
+    int textWidth = 8 * 8 * 3;
+    int xPos = tft.width() - textWidth - marginRight;
+    int yPos = tft.height() - 24 - marginBottom;
+
+    tft.fillRect(xPos, yPos, textWidth, 24, ILI9341_BLACK);
+    tft.setCursor(xPos, yPos);
+
+    if (now.hour() < 10) tft.print("0");
+    tft.print(now.hour());
+    tft.print(":");
+    if (now.minute() < 10) tft.print("0");
+    tft.print(now.minute());
+    tft.print(":");
+    if (now.second() < 10) tft.print("0");
+    tft.print(now.second());
+  }
+}
