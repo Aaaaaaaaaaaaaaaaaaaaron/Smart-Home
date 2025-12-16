@@ -1,0 +1,821 @@
+#include <Wire.h>
+#include <SPI.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_ILI9341.h>
+#include <RTClib.h>
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <WebServer.h>
+#include <Preferences.h>  // NVS Storage
+#include <time.h>         // NTP Zeit-Sync
+#include <ctime>          // tzset()
+
+// Display Pins
+#define TFT_CS   5
+#define TFT_DC   2
+#define TFT_RST  4
+
+// Debug-Level: 0=keine, 1=Fehler, 2=Warnungen, 3=Info, 4=Verbose
+#define DEBUG_LEVEL 4
+
+void debugPrint(int level, const char* component, const char* message) {
+  if (level <= DEBUG_LEVEL) {
+    Serial.print("[");
+    switch(level) {
+      case 1: Serial.print("ERROR"); break;
+      case 2: Serial.print("WARN "); break;
+      case 3: Serial.print("INFO "); break;
+      case 4: Serial.print("DEBUG"); break;
+      default: Serial.print("     "); break;
+    }
+    Serial.print("] [");
+    Serial.print(component);
+    Serial.print("] ");
+    Serial.println(message);
+  }
+}
+
+Adafruit_ILI9341 tft = Adafruit_ILI9341(TFT_CS, TFT_DC, TFT_RST);
+RTC_DS3231 rtc;
+
+// WiFi & MQTT
+const char* ssid = "WLAN-RDF-EU";          // WLAN Name
+const char* password = "wlan@RdF";  // WLAN Passwort
+const char* mqttServer = "172.20.15.179";
+const int mqttPort = 1883;
+const char* mqttTopic = "sensor/test";
+
+// EEPROM Adressen für Konfiguration
+#define EEPROM_SIZE 512
+#define ADDR_SSID 0
+#define ADDR_PASS 32
+#define ADDR_MQTT_IP 64
+#define ADDR_MQTT_PORT 80
+#define ADDR_MQTT_TOPIC 84
+
+// NVS Preferences Objekt
+Preferences preferences;
+
+// WiFi & MQTT Variablen (aus EEPROM)
+String stored_ssid = "";
+String stored_password = "";
+String stored_mqttServer = "172.20.15.179";
+int stored_mqttPort = 1883;
+String stored_mqttTopic = "sensor/test";
+
+WiFiClient espClient;
+PubSubClient client(espClient);
+WebServer server(80);
+
+bool apMode = false;
+
+// Variablen für Texte
+String greetingText = "Hallo Jacob";
+
+// Sensorwerte als Zahlen
+float temperature = 0;
+float humidity = 0;
+float pressure = 0;
+
+// Gespeicherte Werte zur Reduktion von Flackern
+float lastTemperature = -999;
+float lastHumidity = -999;
+float lastPressure = -999;
+bool lastMqttConnected = false;
+int lastHour = -1;
+int lastMinute = -1;
+int lastSecond = -1;
+int lastDay = -1;
+int lastMonth = -1;
+int lastYear = -1;
+
+// Flag für erste Verbindungs-Nachricht
+bool connectionMessageSent = false;
+
+// Fehlerbehandlung für Sensordaten
+String lastError = "";
+String lastErrorType = "";  // "PARSING", "RANGE", "TIMEOUT" etc.
+unsigned long lastErrorTime = 0;
+
+// NTP Synchronisations-Intervall (stündlich, 1 Stunde in Millisekunden)
+#define NTP_SYNC_INTERVAL 60 * 60 * 1000  // 1 Stunde
+
+// Forward Declarations
+void saveConfig();
+void loadConfig();
+void syncTimeWithNTP();
+
+// Funktion, um MQTT-Nachrichten zu verarbeiten
+void callback(char* topic, byte* payload, unsigned int length) {
+  Serial.println("\n=== CALLBACK AUFGERUFEN ===");
+  Serial.print("Topic: ");
+  Serial.println(topic);
+  Serial.print("Length: ");
+  Serial.println(length);
+  
+  String msg = "";
+  for (unsigned int i = 0; i < length; i++) {
+    msg += (char)payload[i];
+  }
+  
+  Serial.print("MQTT Nachricht erhalten: ");
+  Serial.println(msg);
+  
+  // Format: Temp: 23.31 C, Hum: 39.40 %, Druck: 982.73 hPa
+  int tIndex = msg.indexOf("Temp:");
+  int hIndex = msg.indexOf("Hum:");
+  int pIndex = msg.indexOf("Druck:");
+
+  Serial.print("Indizes - tIndex: ");
+  Serial.print(tIndex);
+  Serial.print(" hIndex: ");
+  Serial.print(hIndex);
+  Serial.print(" pIndex: ");
+  Serial.println(pIndex);
+
+  if (tIndex != -1 && hIndex != -1 && pIndex != -1) {
+    String tempStr = msg.substring(tIndex + 6, hIndex - 2);
+    String humStr = msg.substring(hIndex + 5, pIndex - 2);
+    String presStr = msg.substring(pIndex + 7);
+    
+    Serial.print("Raw Strings - Temp: '");
+    Serial.print(tempStr);
+    Serial.print("' Hum: '");
+    Serial.print(humStr);
+    Serial.print("' Pres: '");
+    Serial.print(presStr);
+    Serial.println("'");
+    
+    // Remove "hPa" from pressure string
+    int hpaPos = presStr.indexOf(" h");
+    if (hpaPos != -1) {
+      presStr = presStr.substring(0, hpaPos);
+    }
+
+    float temp = tempStr.toFloat();
+    float hum = humStr.toFloat();
+    float pres = presStr.toFloat();
+    
+    Serial.print("Parsed - Temp: ");
+    Serial.print(temp);
+    Serial.print(" C, Hum: ");
+    Serial.print(hum);
+    Serial.print(" %, Pressure: ");
+    Serial.print(pres);
+    Serial.println(" hPa");
+    
+    // Nur wenn Werte sinnvoll sind
+    if (temp > -50 && temp < 150 && hum >= 0 && hum <= 100 && pres > 0) {
+      temperature = temp;
+      humidity = hum;
+      pressure = pres;
+      Serial.println(">>> Werte aktualisiert! <<<");
+      lastError = "";  // Fehler gelöscht
+      lastErrorType = "";
+    } else {
+      Serial.println("Werte außerhalb des Bereichs!");
+      lastError = "Sensor-Fehler: Werte außerhalb Bereich";
+      lastErrorType = "RANGE";
+      lastErrorTime = millis();
+      debugPrint(1, "SENSOR", lastError.c_str());
+    }
+  } else {
+    Serial.println("Parsing fehlgeschlagen - Format nicht erkannt");
+    lastError = "Sensor-Fehler: Format ungültig";
+    lastErrorType = "PARSING";
+    lastErrorTime = millis();
+    debugPrint(1, "SENSOR", lastError.c_str());
+  }
+  Serial.println("=== CALLBACK ENDE ===\n");
+}
+
+// Verbindung zu MQTT herstellen
+unsigned long lastReconnectAttempt = 0;
+unsigned long lastWiFiCheck = 0;
+unsigned long lastNTPSync = 0;
+
+void reconnectWiFi() {
+  unsigned long now = millis();
+  // Prüfe WiFi-Verbindung alle 10 Sekunden
+  if (now - lastWiFiCheck > 10000) {
+    lastWiFiCheck = now;
+    
+    if (WiFi.status() != WL_CONNECTED) {
+      debugPrint(2, "WIFI", "Verbindung unterbrochen - versuche zu reconnect...");
+      WiFi.disconnect();
+      delay(500);
+      WiFi.begin(stored_ssid.c_str(), stored_password.c_str());
+      
+      // Warte max 5 Sekunden auf Verbindung
+      int wifiTimeout = 0;
+      while (WiFi.status() != WL_CONNECTED && wifiTimeout < 10) {
+        delay(500);
+        Serial.print(".");
+        wifiTimeout++;
+      }
+      
+      if (WiFi.status() == WL_CONNECTED) {
+        String ipStr = "WiFi wiederverbunden! IP: " + WiFi.localIP().toString();
+        debugPrint(3, "WIFI", ipStr.c_str());
+        
+        // Synchronisiere Zeit über NTP
+        syncTimeWithNTP();
+      } else {
+        debugPrint(1, "WIFI", "WiFi Reconnect fehlgeschlagen!");
+      }
+    } else {
+      // WiFi verbunden - Synchronisiere Zeit alle Stunde über NTP
+      if (now - lastNTPSync > 3600000) {  // 1 Stunde
+        syncTimeWithNTP();
+      }
+    }
+  }
+}
+
+void syncTimeWithNTP() {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  debugPrint(3, "NTP", "Synchronisiere Zeit über NTP (UTC)...");
+  
+  // Setze Zeitzone für Lokalzeit-Berechnungen 
+  // CET = Central European Time (UTC+1 Standard, UTC+2 Sommer)
+  setenv("TZ", "CET-1CEST,M3.5.0/2,M10.5.0/3", 1);
+  tzset();
+
+  // Hole NTP Zeit (UTC)
+  configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+
+  time_t now = 0;
+  for (int i = 0; i < 20; i++) {
+    time(&now);
+    if (now > 1600000000) break;  // Valide Zeit erhalten
+    delay(500);
+  }
+
+  if (now > 1600000000) {
+    // RTC bekommt UTC (nie lokale Zeit!)
+    struct tm utc;
+    gmtime_r(&now, &utc);
+
+    rtc.adjust(DateTime(
+      utc.tm_year + 1900,
+      utc.tm_mon + 1,
+      utc.tm_mday,
+      utc.tm_hour,
+      utc.tm_min,
+      utc.tm_sec
+    ));
+
+    // DEBUG: Zeige beide Zeiten
+    struct tm local;
+    localtime_r(&now, &local);
+    Serial.printf("RTC(UTC): %02d:%02d:%02d | LOCAL: %02d:%02d:%02d\n",
+      utc.tm_hour, utc.tm_min, utc.tm_sec,
+      local.tm_hour, local.tm_min, local.tm_sec);
+
+    debugPrint(3, "NTP", "RTC synchronisiert (UTC)");
+    lastNTPSync = millis();
+  } else {
+    debugPrint(2, "NTP", "NTP Synchronisation fehlgeschlagen!");
+  }
+}
+
+void reconnect() {
+  unsigned long now = millis();
+  if (now - lastReconnectAttempt > 5000) {  // Nur alle 5 Sekunden versuchen
+    lastReconnectAttempt = now;
+    
+    if (!client.connected()) {
+      debugPrint(2, "MQTT", "Verbindung unterbrochen - versuche zu reconnect...");
+      
+      if (client.connect("ESP32Client")) {
+        debugPrint(3, "MQTT", "MQTT wiederverbunden!");
+        if (client.subscribe(stored_mqttTopic.c_str())) {
+          String subInfo = "Subscribed zu: " + stored_mqttTopic;
+          debugPrint(3, "MQTT", subInfo.c_str());
+        } else {
+          debugPrint(2, "MQTT", "Subscribe fehlgeschlagen!");
+        }
+      } else {
+        String errMsg = "MQTT Fehler rc=" + String(client.state());
+        debugPrint(2, "MQTT", errMsg.c_str());
+      }
+    }
+  }
+}
+
+// EEPROM lesen
+void loadConfig() {
+  // NVS Speicher öffnen (readonly)
+  preferences.begin("wifi_mqtt", true);
+  
+  // SSID lesen
+  stored_ssid = preferences.getString("ssid", "WLAN-RDF-EU");
+  
+  // Password lesen (verschlüsselt in NVS)
+  stored_password = preferences.getString("password", "wlan@RdF");
+  
+  // MQTT IP lesen
+  stored_mqttServer = preferences.getString("mqtt_ip", "172.20.15.179");
+  
+  // MQTT Port lesen
+  stored_mqttPort = preferences.getInt("mqtt_port", 1883);
+  
+  // MQTT Topic lesen
+  stored_mqttTopic = preferences.getString("mqtt_topic", "sensor/test");
+  
+  preferences.end();
+  
+  Serial.println("\n=== NVS Konfiguration geladen ===");
+  Serial.print("SSID: '");
+  Serial.print(stored_ssid);
+  Serial.println("'");
+  Serial.print("MQTT Server: '");
+  Serial.print(stored_mqttServer);
+  Serial.println("'");
+  Serial.print("MQTT Port: ");
+  Serial.println(stored_mqttPort);
+  Serial.print("Topic: '");
+  Serial.print(stored_mqttTopic);
+  Serial.println("'");
+  Serial.println("=============================\n");
+}
+
+// EEPROM speichern
+void saveConfig() {
+  // NVS Speicher öffnen (readwrite)
+  preferences.begin("wifi_mqtt", false);
+  
+  // SSID speichern
+  preferences.putString("ssid", stored_ssid);
+  
+  // Password speichern (verschlüsselt in NVS)
+  preferences.putString("password", stored_password);
+  
+  // MQTT IP speichern
+  preferences.putString("mqtt_ip", stored_mqttServer);
+  
+  // MQTT Port speichern
+  preferences.putInt("mqtt_port", stored_mqttPort);
+  
+  // MQTT Topic speichern
+  preferences.putString("mqtt_topic", stored_mqttTopic);
+  
+  preferences.end();
+  
+  Serial.println("\n>>> Konfiguration in NVS gespeichert! <<<");
+  Serial.print("SSID: ");
+  Serial.println(stored_ssid);
+  Serial.print("Topic: ");
+  Serial.println(stored_mqttTopic);
+  Serial.println();
+}
+
+// Webserver Root-Seite
+void handleRoot() {
+  String html = R"(
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <title>WiFi & MQTT Config</title>
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <style>
+        body { font-family: Arial; text-align: center; padding: 20px; background-color: #f0f0f0; }
+        .container { max-width: 400px; margin: auto; background-color: white; padding: 20px; border-radius: 8px; box-shadow: 0 0 10px rgba(0,0,0,0.1); }
+        h1 { color: #333; }
+        input { width: 100%; padding: 10px; margin: 10px 0; box-sizing: border-box; border: 1px solid #ddd; border-radius: 4px; }
+        button { width: 100%; padding: 10px; background-color: #4CAF50; color: white; border: none; border-radius: 4px; cursor: pointer; font-size: 16px; }
+        button:hover { background-color: #45a049; }
+        label { display: block; text-align: left; font-weight: bold; margin-top: 10px; }
+      </style>
+    </head>
+    <body>
+      <div class="container">
+        <h1>Smart Home Config</h1>
+        <form action="/save" method="POST">
+          <label>WiFi SSID:</label>
+          <input type="text" name="ssid" value=")" + stored_ssid + R"(" required>
+          
+          <label>WiFi Password:</label>
+          <input type="password" name="password" value=")" + stored_password + R"(" required>
+          
+          <label>MQTT Server IP:</label>
+          <input type="text" name="mqtt_ip" value=")" + stored_mqttServer + R"(" required>
+          
+          <label>MQTT Port:</label>
+          <input type="number" name="mqtt_port" value=")" + String(stored_mqttPort) + R"(" required>
+          
+          <label>MQTT Topic:</label>
+          <input type="text" name="mqtt_topic" value=")" + stored_mqttTopic + R"(" required>
+          
+          <button type="submit">Speichern & Neu Starten</button>
+        </form>
+      </div>
+    </body>
+    </html>
+  )";
+  
+  server.send(200, "text/html", html);
+}
+
+// Webserver Speicher-Funktion
+void handleSave() {
+  if (server.hasArg("ssid") && server.hasArg("password") && server.hasArg("mqtt_ip") && 
+      server.hasArg("mqtt_port") && server.hasArg("mqtt_topic")) {
+    
+    stored_ssid = server.arg("ssid");
+    stored_password = server.arg("password");
+    stored_mqttServer = server.arg("mqtt_ip");
+    stored_mqttPort = server.arg("mqtt_port").toInt();
+    stored_mqttTopic = server.arg("mqtt_topic");
+    
+    saveConfig();
+    
+    server.send(200, "text/html", "<h1>Gespeichert!</h1><p>Starten Sie den ESP32 neu...</p>");
+    delay(2000);
+    ESP.restart();
+  } else {
+    server.send(400, "text/plain", "Fehlende Parameter");
+  }
+}
+
+// AP Modus starten
+void startAPMode() {
+  apMode = true;
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP("SmartHome-Config", "12345678");
+  
+  Serial.println("\n\nAP Mode gestartet!");
+  Serial.print("SSID: SmartHome-Config");
+  Serial.print("IP: ");
+  Serial.println(WiFi.softAPIP());
+  
+  server.on("/", handleRoot);
+  server.on("/save", HTTP_POST, handleSave);
+  server.begin();
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  
+  debugPrint(3, "SYSTEM", "=== Smart Home System Start ===");
+  debugPrint(3, "SYSTEM", "Lade Konfiguration aus NVS...");
+
+  // EEPROM laden
+  loadConfig();
+  
+  // Falls Topic nicht gespeichert oder falsch, korrigiere es
+  if (stored_mqttTopic.length() == 0 || stored_mqttTopic.indexOf("Sensor") != -1) {
+    debugPrint(2, "CONFIG", "Topic ist leer oder falsch - setze auf 'sensor/test'");
+    stored_mqttTopic = "sensor/test";
+    saveConfig();
+  }
+
+  // RTC starten
+  debugPrint(3, "RTC", "Initialisiere RTC...");
+  if (!rtc.begin()) {
+    debugPrint(1, "RTC", "FEHLER: RTC nicht gefunden!");
+    while (1);
+  }
+
+  // Display starten
+  debugPrint(3, "DISPLAY", "Initialisiere ILI9341 Display...");
+  tft.begin();
+  tft.setRotation(1);
+  tft.fillScreen(ILI9341_BLACK);
+  debugPrint(3, "DISPLAY", "Display erfolgreich initialisiert");
+
+  // WLAN verbinden
+  debugPrint(3, "WIFI", "Starte WiFi-Verbindung...");
+  WiFi.mode(WIFI_STA);
+  String ssidMsg = "SSID: " + stored_ssid;
+  debugPrint(3, "WIFI", ssidMsg.c_str());
+  WiFi.begin(stored_ssid.c_str(), stored_password.c_str());
+  
+  int timeout = 0;
+  while (WiFi.status() != WL_CONNECTED && timeout < 60) {
+    delay(500);
+    Serial.print(".");
+    timeout++;
+  }
+  
+  Serial.println("");
+  if (WiFi.status() == WL_CONNECTED) {
+    debugPrint(3, "WIFI", "WiFi verbunden!");
+    String ipStr = "IP: " + WiFi.localIP().toString();
+    debugPrint(3, "WIFI", ipStr.c_str());
+    
+    // KRITISCH: Synchronisiere RTC sofort mit NTP, auch wenn MQTT nicht funktioniert!
+    debugPrint(3, "SETUP", "Synchronisiere RTC mit NTP...");
+    syncTimeWithNTP();
+  } else {
+    debugPrint(1, "WIFI", "WiFi Verbindung fehlgeschlagen!");
+    debugPrint(3, "WIFI", "Starte AP Mode für Konfiguration...");
+    startAPMode();
+    return;
+  }
+
+  client.setServer(stored_mqttServer.c_str(), stored_mqttPort);
+  client.setCallback(callback);
+  
+  // MQTT verbindung herstellen
+  debugPrint(3, "MQTT", "Starte MQTT-Verbindung...");
+  String mqttInfo = "Server: " + stored_mqttServer + ":" + String(stored_mqttPort);
+  debugPrint(3, "MQTT", mqttInfo.c_str());
+  
+  int mqtt_timeout = 0;
+  while (!client.connected() && mqtt_timeout < 20) {
+    if (client.connect("ESP32Client")) {
+      debugPrint(3, "MQTT", "MQTT erfolgreich verbunden!");
+      client.subscribe(stored_mqttTopic.c_str());
+      String subInfo = "Subscribed zu: " + stored_mqttTopic;
+      debugPrint(3, "MQTT", subInfo.c_str());
+      break;
+    } else {
+      debugPrint(2, "MQTT", "Verbindung fehlgeschlagen - Versuche erneut...");
+      delay(500);
+      mqtt_timeout++;
+    }
+  }
+  
+  if (client.connected()) {
+    debugPrint(3, "MQTT", "Warte auf MQTT Nachrichten...");
+    
+    // Sende Verbindungs-Nachricht
+    String connectionMsg = "ESP32 verbunden!";
+    client.publish(stored_mqttTopic.c_str(), connectionMsg.c_str());
+    String pubInfo = "Nachricht gesendet: " + connectionMsg;
+    debugPrint(3, "MQTT", pubInfo.c_str());
+    
+    connectionMessageSent = true;
+    
+    // NTP wird bereits nach WiFi-Verbindung aufgerufen (nicht hier nochmal)
+    // Display mit "Warte auf Daten" Nachricht
+    tft.fillScreen(ILI9341_BLACK);
+    tft.setCursor(10, 50);
+    tft.setTextSize(2);
+    tft.setTextColor(ILI9341_YELLOW);
+    tft.println("Warte auf");
+    tft.println("Daten...");
+  }
+  
+  debugPrint(3, "SYSTEM", "=== Setup abgeschlossen ===");
+}
+
+unsigned long lastDisplayUpdate = 0;
+unsigned long lastLoopCount = 0;
+
+void loop() {
+  // Zähle wie oft die Loop aufgerufen wird
+  lastLoopCount++;
+  
+  // WiFi-Verbindung überprüfen und ggf. reconnect
+  reconnectWiFi();
+  
+  // MQTT verarbeiten und auf Nachrichten warten
+  if (!apMode) {
+    // Stelle sicher, dass die Verbindung stabil ist
+    if (!client.connected()) {
+      reconnect();
+    } else {
+      // client.loop() verarbeitet eingehende Nachrichten
+      client.loop();
+    }
+  } else {
+    // AP Mode: Webserver verarbeiten
+    server.handleClient();
+  }
+
+  // Display aktualisieren mit optimiertem Flackern-Reduktion (alle 1000ms)
+  unsigned long now_ms = millis();
+  if (now_ms - lastDisplayUpdate >= 1000) {
+    lastDisplayUpdate = now_ms;
+    
+    // Resynchronisiere RTC mit NTP alle 24 Stunden (um Abweichungen zu korrigieren)
+    if (WiFi.status() == WL_CONNECTED && now_ms - lastNTPSync >= NTP_SYNC_INTERVAL) {
+      syncTimeWithNTP();
+    }
+    
+    // Debug: Zeige Loop-Frequenz
+    Serial.print("Loop-Frequenz: ");
+    Serial.print(lastLoopCount);
+    Serial.print(" Hz | MQTT: ");
+    Serial.print(client.connected() ? "Connected" : "Disconnected");
+    Serial.print(" | Temp: ");
+    Serial.print(temperature);
+    Serial.println(" C");
+    lastLoopCount = 0;
+    
+    DateTime now = rtc.now();
+    bool screenNeedsRedraw = false;
+
+    // Prüfe ob Temperatur geändert hat (mit Toleranz 0.05)
+    if (abs(temperature - lastTemperature) >= 0.05) {
+      lastTemperature = temperature;
+      
+      // Lösche und zeichne Temperatur neu (Gelb) - zentriert
+      tft.fillRect(0, 30, 320, 16, ILI9341_BLACK);
+      tft.setTextSize(2);
+      tft.setTextColor(ILI9341_YELLOW);
+      
+      // Berechne zentrierte Position
+      String tempStr = "Temp: " + String(temperature, 2) + " C";
+      int16_t x1, y1;
+      uint16_t w, h;
+      tft.getTextBounds(tempStr, 0, 0, &x1, &y1, &w, &h);
+      int xPos = (320 - w) / 2;
+      
+      tft.setCursor(xPos, 30);
+      tft.print(tempStr);
+    }
+
+    // Prüfe ob Luftfeuchte geändert hat (mit Toleranz 0.05)
+    if (abs(humidity - lastHumidity) >= 0.05) {
+      lastHumidity = humidity;
+      
+      // Lösche und zeichne Luftfeuchte neu (Gelb) - zentriert
+      tft.fillRect(0, 50, 320, 16, ILI9341_BLACK);
+      tft.setTextSize(2);
+      tft.setTextColor(ILI9341_YELLOW);
+      
+      // Berechne zentrierte Position
+      String humStr = "Humidity: " + String(humidity, 2) + "%";
+      int16_t x1, y1;
+      uint16_t w, h;
+      tft.getTextBounds(humStr, 0, 0, &x1, &y1, &w, &h);
+      int xPos = (320 - w) / 2;
+      
+      tft.setCursor(xPos, 50);
+      tft.print(humStr);
+    }
+
+    // Prüfe ob Druck geändert hat (mit Toleranz 0.05)
+    if (abs(pressure - lastPressure) >= 0.05) {
+      lastPressure = pressure;
+      
+      // Lösche und zeichne Druck neu (Gelb) - zentriert
+      tft.fillRect(0, 70, 320, 16, ILI9341_BLACK);
+      tft.setTextSize(2);
+      tft.setTextColor(ILI9341_YELLOW);
+      
+      // Berechne zentrierte Position
+      String presStr = "Pressure: " + String(pressure, 2) + " hPa";
+      int16_t x1, y1;
+      uint16_t w, h;
+      tft.getTextBounds(presStr, 0, 0, &x1, &y1, &w, &h);
+      int xPos = (320 - w) / 2;
+      
+      tft.setCursor(xPos, 70);
+      tft.print(presStr);
+    }
+
+    // Zeige MQTT-Verbindung kontinuierlich an (MUSS VOR Fehler sein!)
+    bool mqttConnected = client.connected();
+    if (mqttConnected != lastMqttConnected) {
+      lastMqttConnected = mqttConnected;
+      
+      // Lösche und zeichne Status neu (Grün/Rot) - zentriert
+      tft.fillRect(0, 88, 320, 14, ILI9341_BLACK);
+      tft.setTextSize(1);
+      
+      String statusStr = mqttConnected ? "MQTT: Connected" : "MQTT: Disconnected";
+      if (mqttConnected) {
+        tft.setTextColor(ILI9341_GREEN);
+      } else {
+        tft.setTextColor(ILI9341_RED);
+      }
+      
+      // Berechne zentrierte Position
+      int16_t x1, y1;
+      uint16_t w, h;
+      tft.getTextBounds(statusStr, 0, 0, &x1, &y1, &w, &h);
+      int xPos = (320 - w) / 2;
+      
+      tft.setCursor(xPos, 88);
+      tft.print(statusStr);
+    }
+
+    // Zeige Fehler unter MQTT (wenn vorhanden)
+    if (lastError.length() > 0) {
+      // Lösche alte Fehlerzeile
+      tft.fillRect(0, 103, 320, 14, ILI9341_BLACK);
+      
+      // Zeichne Fehler in Rot (kleinerer Text)
+      tft.setTextSize(1);
+      tft.setTextColor(ILI9341_RED);
+      
+      // Kürze den Error-Text für das Display
+      String displayError = lastError;
+      if (displayError.length() > 32) {
+        displayError = displayError.substring(0, 29) + "...";
+      }
+      
+      // Berechne zentrierte Position
+      int16_t x1, y1;
+      uint16_t w, h;
+      tft.getTextBounds(displayError, 0, 0, &x1, &y1, &w, &h);
+      int xPos = (320 - w) / 2;
+      
+      tft.setCursor(xPos, 103);
+      tft.print(displayError);
+    } else {
+      // Lösche Fehlerzeile wenn kein Fehler mehr
+      tft.fillRect(0, 103, 320, 14, ILI9341_BLACK);
+    }
+
+    // Prüfe ob Zeit geändert hat (Sekunde)
+    // Konvertiere UTC (von RTC) zu Lokalzeit (CET/CEST)
+    time_t rawTime = now.unixtime();
+    struct tm local;
+    localtime_r(&rawTime, &local);
+    
+    // Automatische Anpassung für CET/CEST
+    // Bestimme ob wir in der Sommerzeit sind (letzte Sonntag im März bis letzte Sonntag im Oktober)
+    int month = local.tm_mon + 1;
+    int mday = local.tm_mday;
+    int wday = local.tm_wday;  // 0 = Sonntag
+    
+    bool isDST = false;
+    if (month > 3 && month < 10) {
+      // April bis September: definitiv Sommerzeit
+      isDST = true;
+    } else if (month == 3) {
+      // März: Sommerzeit ab letztem Sonntag
+      int lastSunday = mday - wday;
+      if (mday >= lastSunday) isDST = true;
+    } else if (month == 10) {
+      // Oktober: Sommerzeit bis letztem Sonntag
+      int lastSunday = mday - wday;
+      if (mday < lastSunday) isDST = true;
+    }
+    
+    // Addiere 1 Stunde (Winter/CET) oder 2 Stunden (Sommer/CEST)
+    local.tm_hour = (local.tm_hour + (isDST ? 2 : 1)) % 24;
+    
+    if (local.tm_hour != lastHour || local.tm_min != lastMinute || local.tm_sec != lastSecond) {
+      lastHour = local.tm_hour;
+      lastMinute = local.tm_min;
+      lastSecond = local.tm_sec;
+      
+      // Lösche und zeichne Uhrzeit neu (Rot) - rechtsbündig unten rechts
+      tft.setTextSize(3);
+      tft.setTextColor(ILI9341_RED);
+      
+      // Formatiere Uhrzeit in Lokalzeit
+      String timeStr = "";
+      if (local.tm_hour < 10) timeStr += "0";
+      timeStr += String(local.tm_hour) + ":";
+      if (local.tm_min < 10) timeStr += "0";
+      timeStr += String(local.tm_min) + ":";
+      if (local.tm_sec < 10) timeStr += "0";
+      timeStr += String(local.tm_sec);
+      
+      // Berechne rechtsbündige Position
+      int16_t x1, y1;
+      uint16_t w, h;
+      tft.getTextBounds(timeStr, 0, 0, &x1, &y1, &w, &h);
+      int xPos = 320 - w - 5;  // 5px von rechts
+      int yPos = 240 - 24 - 5;  // 5px von unten
+      
+      tft.fillRect(xPos - 2, yPos - 2, w + 4, h + 4, ILI9341_BLACK);
+      tft.setCursor(xPos, yPos);
+      tft.print(timeStr);
+      
+      // DEBUG: Zeige UTC vs Local Zeit im Serial Monitor
+      Serial.printf("RTC(UTC): %02d:%02d:%02d | Display: %02d:%02d:%02d\n",
+        now.hour(), now.minute(), now.second(),
+        local.tm_hour, local.tm_min, local.tm_sec);
+    }
+
+    // Prüfe ob Datum geändert hat (täglich Update)
+    if (local.tm_mday != lastDay || local.tm_mon + 1 != lastMonth || local.tm_year + 1900 != lastYear) {
+      lastDay = local.tm_mday;
+      lastMonth = local.tm_mon + 1;
+      lastYear = local.tm_year + 1900;
+      
+      // Lösche und zeichne Datum neu (Cyan) - rechtsbündig über der Uhrzeit
+      tft.setTextSize(2);
+      tft.setTextColor(ILI9341_CYAN);
+      
+      // Formatiere Datum
+      String dateStr = "";
+      if (local.tm_mday < 10) dateStr += "0";
+      dateStr += String(local.tm_mday) + ".";
+      if (local.tm_mon + 1 < 10) dateStr += "0";
+      dateStr += String(local.tm_mon + 1) + ".";
+      dateStr += String(local.tm_year + 1900);
+      
+      // Berechne rechtsbündige Position
+      int16_t x1, y1;
+      uint16_t w, h;
+      tft.getTextBounds(dateStr, 0, 0, &x1, &y1, &w, &h);
+      int xPos = 320 - w - 5;  // 5px von rechts
+      int yPos = 240 - 50;     // über der Uhrzeit
+      
+      tft.fillRect(xPos - 2, yPos - 2, w + 4, h + 4, ILI9341_BLACK);
+      tft.setCursor(xPos, yPos);
+      tft.print(dateStr);
+    }
+  }
+}
